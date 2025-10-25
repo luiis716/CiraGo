@@ -161,12 +161,3 @@ govulncheck ./...
 Este projeto é licenciado sob a **MIT License**. Veja o arquivo [LICENSE](./LICENSE) para mais detalhes.
 
 ---
-
-## Créditos
-
-* [whatsmeow](https://github.com/tulir/whatsmeow) — implementação do protocolo do WhatsApp
-* Comunidade Go — ecosistema e libs
-
----
-
-Se quiser, eu já adiciono um `Dockerfile` + `docker-compose.yml` com Postgres e a app prontos pra subir com `docker compose up -d`. Quer que eu inclua?
