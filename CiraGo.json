@@ -1,0 +1,239 @@
+{
+  "info": {
+    "name": "CiraGo",
+    "_postman_id": "cira-go-collection-0001",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Coleção CiraGo: sessão admin e operações por sessão (start, QR, status, send, logout)."
+  },
+  "item": [
+    {
+      "name": "Admin",
+      "item": [
+        {
+          "name": "Criar sessão",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id\": \"{{sessionId}}\",\n  \"token\": \"{{sessionToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions"
+              ]
+            },
+            "description": "Cria/carrega uma sessão e define o token dela.\nResposta esperada:\n{\"sessionId\":\"botA\",\"sessionToken\":\"token-botA\"}"
+          },
+          "response": []
+        },
+        {
+          "name": "Listar sessões",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{adminToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions"
+              ]
+            },
+            "description": "Lista todas as sessões carregadas no servidor."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Sessão",
+      "item": [
+        {
+          "name": "Iniciar conexão (start + fluxo QR)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sessionToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/start",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "start"
+              ]
+            },
+            "description": "Inicia a sessão WhatsApp e gera QR interno."
+          },
+          "response": []
+        },
+        {
+          "name": "Baixar QR (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sessionToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/qr.png",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "qr.png"
+              ]
+            },
+            "description": "Retorna o QR code da sessão em PNG (para parear no WhatsApp Web). Salvar via --output no curl."
+          },
+          "response": []
+        },
+        {
+          "name": "Status da sessão",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sessionToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "status"
+              ]
+            },
+            "description": "Mostra o estado atual da sessão (conectado, aguardando QR, etc)."
+          },
+          "response": []
+        },
+        {
+          "name": "Enviar mensagem de texto",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sessionToken}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"to\": \"+5585XXXXXXXX\",\n  \"message\": \"olá do {{sessionId}} com token!\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/send",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "send"
+              ]
+            },
+            "description": "Envia mensagem de texto WhatsApp para o número indicado no campo 'to'."
+          },
+          "response": []
+        },
+        {
+          "name": "Logout (desconectar/apagar sessão local)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{sessionToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{sessionId}}/logout",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "sessions",
+                "{{sessionId}}",
+                "logout"
+              ]
+            },
+            "description": "Desconecta do WhatsApp e remove os dados locais dessa sessão."
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "event": [],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8080",
+      "type": "string"
+    },
+    {
+      "key": "adminToken",
+      "value": "MINHA-CHAVE-MESTRA-SUPER-SECRETA",
+      "type": "string"
+    },
+    {
+      "key": "sessionToken",
+      "value": "token-botA",
+      "type": "string"
+    },
+    {
+      "key": "sessionId",
+      "value": "botA",
+      "type": "string"
+    }
+  ]
+}
