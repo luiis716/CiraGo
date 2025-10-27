@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,7 +25,8 @@ import (
 	waE2E "go.mau.fi/whatsmeow/binary/proto"
 )
 
-const meowsVersion = "whatsmeow-pg-single-schema-public-2"
+const meowsVersion = "whatsmeow-pg-single-schema-public-5"
+const qrTTL = 60 * time.Second // QR válido por, no máximo, 60s
 
 func main() {
 	_ = godotenv.Load()
@@ -35,7 +37,7 @@ func main() {
 		log.Println("[WARN] ADMIN_TOKEN não definido — defina no .env para proteger rotas administrativas.")
 	}
 
-	// DB (public)
+	// DB (schema público)
 	dbm, err := NewDBManagerFromEnv()
 	if err != nil {
 		log.Fatalf("erro DB: %v", err)
@@ -44,7 +46,16 @@ func main() {
 		log.Fatalf("erro init DB/migrations: %v", err)
 	}
 
-	mgr := NewSessionManager(dbm, adminToken)
+	// Auto reconexão/presença sempre ligadas
+	autoConnect := true
+	autoPresence := true
+
+	mgr := NewSessionManager(dbm, adminToken, autoConnect, autoPresence)
+
+	// Pré-carrega sessões e reconecta as pareadas
+	if err := mgr.PreloadFromDB(context.Background()); err != nil {
+		log.Printf("[warn] preload sessions: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) })
@@ -92,14 +103,12 @@ func main() {
 		case http.MethodGet:
 			// lista com tokens (ADMIN only)
 			stats := mgr.StatusAllExact()
-			// injeta tokens reais (de memória) ou do banco (fallback) em cada item
 			for i, st := range stats {
 				idAny := st["sessionId"]
 				id, _ := idAny.(string)
 				if id == "" {
 					continue
 				}
-				// tenta pegar da memória
 				if s := mgr.getInMemory(id); s != nil {
 					if tok := s.GetToken(); tok != "" {
 						st["token"] = tok
@@ -107,7 +116,6 @@ func main() {
 						continue
 					}
 				}
-				// fallback banco
 				if tok, err := mgr.dbm.GetInstanceTokenPlain(r.Context(), id); err == nil && tok != "" {
 					st["token"] = tok
 					stats[i] = st
@@ -133,13 +141,12 @@ func main() {
 			action = parts[1]
 		}
 
-		// GET /sessions/{id}/token  (ADMIN) -> retorna o token em texto
+		// GET /sessions/{id}/token  (ADMIN)
 		if action == "token" && r.Method == http.MethodGet {
 			if !mgr.isAdmin(r) {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			// tenta memória; se vazio, banco
 			if s := mgr.getInMemory(id); s != nil {
 				if tok := s.GetToken(); tok != "" {
 					jsonWrite(w, map[string]string{"sessionId": id, "token": tok}, http.StatusOK)
@@ -174,7 +181,7 @@ func main() {
 			return
 		}
 
-		// demais rotas precisam da sessão
+		// precisa da sessão
 		sess, err := mgr.GetOrCreate(id)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("erro abrir sessão: %v", err), http.StatusInternalServerError)
@@ -204,7 +211,7 @@ func main() {
 			}
 			code := sess.QR()
 			if code == "" {
-				http.Error(w, "QR ainda não disponível. Chame /sessions/"+id+"/start primeiro.", http.StatusNotFound)
+				http.Error(w, "QR ainda não disponível ou expirado. Chame /sessions/"+id+"/start.", http.StatusNotFound)
 				return
 			}
 			png, err := qrcode.Encode(code, qrcode.Medium, 256)
@@ -222,7 +229,6 @@ func main() {
 				return
 			}
 			st := sess.SafeStatus()
-			// ADMIN também enxerga o token aqui
 			if mgr.isAdmin(r) {
 				if tok := sess.GetToken(); tok != "" {
 					st["token"] = tok
@@ -270,26 +276,94 @@ func main() {
 
 	handler := recoverMiddleware(mux)
 
-	log.Printf("API multi-sessões (Postgres, schema público) ouvindo em %s", addr)
+	log.Printf("API multi-sessões (Postgres, schema público) ouvindo em %s | AUTO_CONNECT=on", addr)
 	log.Fatal(http.ListenAndServe(addr, handler))
 }
 
 /* ---------- Session Manager ---------- */
 
 type SessionManager struct {
-	dbm        *DBManager
-	adminToken string
+	dbm          *DBManager
+	adminToken   string
+	autoConnect  bool
+	autoPresence bool
 
 	mu   sync.RWMutex
 	sess map[string]*Session
 }
 
-func NewSessionManager(dbm *DBManager, adminToken string) *SessionManager {
+func NewSessionManager(dbm *DBManager, adminToken string, autoConnect, autoPresence bool) *SessionManager {
 	return &SessionManager{
-		dbm:        dbm,
-		adminToken: adminToken,
-		sess:       make(map[string]*Session),
+		dbm:          dbm,
+		adminToken:   adminToken,
+		autoConnect:  autoConnect,
+		autoPresence: autoPresence,
+		sess:         make(map[string]*Session),
 	}
+}
+
+// Pré-carrega todas as instâncias persistidas (recria clients com devices existentes)
+func (m *SessionManager) PreloadFromDB(ctx context.Context) error {
+	rows, err := m.dbm.ListInstances(ctx)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		id := r.ID
+
+		// já existe em memória? pula
+		m.mu.RLock()
+		_, ok := m.sess[id]
+		m.mu.RUnlock()
+		if ok {
+			continue
+		}
+
+		var devStore *store.Device
+		hasJID := r.JID.Valid && r.JID.String != ""
+		if hasJID {
+			if jid, err := parseJIDText(r.JID.String); err == nil && jid != nil {
+				ds, err := m.dbm.Container.GetDevice(ctx, *jid)
+				if err != nil {
+					log.Printf("[warn] GetDevice(%s) falhou: %v (não criaremos NewDevice para não sobrescrever)", r.JID.String, err)
+					continue
+				}
+				devStore = ds
+			}
+		}
+		if !hasJID {
+			// sessão nova (ainda sem parear): pode ter um device vazio
+			devStore = m.dbm.Container.NewDevice()
+		}
+		if devStore == nil {
+			continue
+		}
+
+		cli := whatsmeow.NewClient(devStore, nil)
+
+		s := &Session{
+			id:        id,
+			client:    cli,
+			dbm:       m.dbm,
+			jid:       strOrEmpty(r.JID),
+			connected: false, // runtime será atualizado por eventos/Connect()
+			loggedIn:  false,
+		}
+		s.registerHandlers()
+		if r.TokenPlain.Valid {
+			s.SetToken(r.TokenPlain.String)
+		}
+
+		m.mu.Lock()
+		m.sess[id] = s
+		m.mu.Unlock()
+
+		// se já tem JID (pareado), reconecta sempre
+		if hasJID && m.autoConnect {
+			go s.AutoReconnectOnBoot(m.autoPresence)
+		}
+	}
+	return nil
 }
 
 func (m *SessionManager) StatusAllExact() []map[string]any {
@@ -318,10 +392,8 @@ func (m *SessionManager) GetOrCreate(id string) (*Session, error) {
 	}
 	m.mu.RUnlock()
 
-	ctx := context.Background()
-
 	// 1) pega JID salvo (se houver)
-	jidStr, err := m.dbm.GetInstanceJID(ctx, id)
+	jidStr, err := m.dbm.GetInstanceJID(context.Background(), id)
 	if err != nil {
 		return nil, fmt.Errorf("buscar jid da instância: %w", err)
 	}
@@ -330,23 +402,24 @@ func (m *SessionManager) GetOrCreate(id string) (*Session, error) {
 	var devStore *store.Device
 	if jidStr != "" {
 		if jid, err := parseJIDText(jidStr); err == nil && jid != nil {
-			devStore, err = m.dbm.Container.GetDevice(ctx, *jid)
+			devStore, err = m.dbm.Container.GetDevice(context.Background(), *jid)
 			if err != nil {
+				// se já existe JID e falhou pegar o device, não crie novo para não sobrescrever chaves
 				return nil, fmt.Errorf("GetDevice: %w", err)
 			}
 		}
 	}
 	if devStore == nil {
+		// sessão ainda não pareada: cria device "vazio"
 		devStore = m.dbm.Container.NewDevice()
 	}
 
 	cli := whatsmeow.NewClient(devStore, nil)
 
 	s := &Session{
-		id:     id,
-		client: cli,
-		dbm:    m.dbm,
-
+		id:        id,
+		client:    cli,
+		dbm:       m.dbm,
 		connected: false,
 		loggedIn:  false,
 		jid:       jidStr,
@@ -354,13 +427,19 @@ func (m *SessionManager) GetOrCreate(id string) (*Session, error) {
 	s.registerHandlers()
 
 	// metadata mínima (não atualiza token aqui)
-	if err := m.dbm.UpsertInstance(ctx, id, jidStr, "", meowsVersion, ""); err != nil {
+	if err := m.dbm.UpsertInstance(context.Background(), id, jidStr, "", meowsVersion, ""); err != nil {
 		log.Printf("[warn] upsert instance meta: %v", err)
 	}
 
 	m.mu.Lock()
 	m.sess[id] = s
 	m.mu.Unlock()
+
+	// se já tem JID, reconecta sempre
+	if jidStr != "" && m.autoConnect {
+		go s.AutoReconnectOnBoot(m.autoPresence)
+	}
+
 	return s, nil
 }
 
@@ -377,11 +456,7 @@ func (m *SessionManager) DeleteSession(id string) error {
 			return err
 		}
 	}
-	ctx := context.Background()
-	if err := m.dbm.DeleteInstance(ctx, id); err != nil {
-		return err
-	}
-	return nil
+	return m.dbm.DeleteInstance(context.Background(), id)
 }
 
 func (m *SessionManager) isAdmin(r *http.Request) bool {
@@ -449,6 +524,10 @@ func (s *Session) registerHandlers() {
 					s.jid = s.client.Store.ID.String()
 				}
 			}
+			// ao conectar/logar, zera qualquer QR remanescente
+			s.qrStr = ""
+			s.qrTS = time.Time{}
+
 			jid := s.jid
 			connected := s.connected
 			logged := s.loggedIn
@@ -468,22 +547,87 @@ func (s *Session) registerHandlers() {
 	})
 }
 
-func (s *Session) Start() error {
-	s.mu.Lock()
-	if s.started {
-		s.mu.Unlock()
+// AutoReconectar no boot (para sessões com JID salvo)
+func (s *Session) AutoReconnectOnBoot(sendPresence bool) {
+	// Não interfere em sessões não pareadas (sem JID)
+	s.mu.RLock()
+	hasJID := s.jid != ""
+	isConn := s.client != nil && s.client.IsConnected()
+	s.mu.RUnlock()
+	if !hasJID || isConn {
+		return
+	}
+
+	backoffs := []time.Duration{0, 2 * time.Second, 5 * time.Second, 10 * time.Second}
+	for i, d := range backoffs {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		err := s.connectOnce(sendPresence)
+		if err == nil {
+			log.Printf("[%s][boot] reconectado (tentativa #%d)", s.id, i+1)
+			return
+		}
+		log.Printf("[%s][boot] reconectar falhou (tentativa #%d): %v", s.id, i+1, err)
+	}
+	log.Printf("[%s][boot] não foi possível reconectar automaticamente (verifique rede/ban/etc.)", s.id)
+}
+
+func (s *Session) connectOnce(sendPresence bool) error {
+	s.mu.RLock()
+	cli := s.client
+	s.mu.RUnlock()
+	if cli == nil {
+		return errors.New("client nil")
+	}
+	if cli.IsConnected() {
 		return nil
 	}
+
+	// Connect() não recebe context
+	if err := cli.Connect(); err != nil {
+		return err
+	}
+	if sendPresence {
+		_ = cli.SendPresence(types.PresenceAvailable)
+	}
+	return nil
+}
+
+// recria um client novo com um device novo (chamar com s.mu já travado)
+func (s *Session) recreateClientUnlocked() {
+	newDev := s.dbm.Container.NewDevice()
+	s.client = whatsmeow.NewClient(newDev, nil)
+	// re-registra os handlers no novo client
+	s.registerHandlers()
+}
+
+func (s *Session) Start() error {
+	s.mu.Lock()
+	// se ficou travado como "started", decide se reusa ou reinicia
+	if s.started {
+		// se já está conectado, não precisa recomeçar
+		if s.client != nil && s.client.IsConnected() {
+			s.mu.Unlock()
+			return nil
+		}
+		// força novo ciclo
+		s.started = false
+	}
+	// reset QR sempre ao iniciar
+	s.qrStr = ""
+	s.qrTS = time.Time{}
+
 	s.started = true
 	s.stopChan = make(chan struct{})
 	s.mu.Unlock()
 
-	ctx := context.Background()
-	qrChan, err := s.client.GetQRChannel(ctx)
+	qrChan, err := s.client.GetQRChannel(context.Background())
 	if err != nil {
 		s.resetStarted()
 		return fmt.Errorf("GetQRChannel: %w", err)
 	}
+
 	go func() {
 		for item := range qrChan {
 			if item.Code != "" {
@@ -501,13 +645,24 @@ func (s *Session) Start() error {
 				if s.client != nil && s.client.Store != nil {
 					s.jid = s.client.Store.ID.String()
 				}
+				// QR não é mais necessário
+				s.qrStr = ""
+				s.qrTS = time.Time{}
 				jid := s.jid
 				s.mu.Unlock()
+
 				_ = s.dbm.UpsertInstance(context.Background(), s.id, jid, "", meowsVersion, "")
 				_ = s.dbm.UpdateInstanceStatus(context.Background(), s.id, jid, true, true)
 				log.Printf("[%s][qr] pareado com sucesso (jid=%s)", s.id, s.jid)
+
 			case "timeout":
+				// QR venceu: zera para não servir QR expirado
+				s.mu.Lock()
+				s.qrStr = ""
+				s.qrTS = time.Time{}
+				s.mu.Unlock()
 				log.Printf("[%s][qr] timeout; chame /sessions/%s/start novamente", s.id, s.id)
+
 			case "error":
 				if item.Error != nil {
 					log.Printf("[%s][qr] erro: %v", s.id, item.Error)
@@ -524,17 +679,28 @@ func (s *Session) Start() error {
 	return nil
 }
 
+func (s *Session) hasValidQRLocked() bool {
+	if s.qrStr == "" {
+		return false
+	}
+	return time.Since(s.qrTS) <= qrTTL
+}
+
 func (s *Session) QR() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if !s.hasValidQRLocked() {
+		return ""
+	}
 	return s.qrStr
 }
 
 func (s *Session) Status() map[string]any {
 	s.mu.RLock()
+	hasValidQR := s.hasValidQRLocked()
 	out := map[string]any{
 		"connected": s.connected,
-		"has_qr":    s.qrStr != "",
+		"has_qr":    hasValidQR,
 		"jid":       s.jid,
 		"logged_in": s.loggedIn,
 		"qr_at":     s.qrTS,
@@ -590,30 +756,43 @@ func (s *Session) SendText(to, message string) (map[string]any, error) {
 }
 
 func (s *Session) Logout() error {
-	if s.client == nil {
-		s.mu.Lock()
-		s.connected = false
-		s.loggedIn = false
-		jid := s.jid
-		s.mu.Unlock()
-		_ = s.dbm.UpdateInstanceStatus(context.Background(), s.id, jid, false, false)
-		return nil
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	_ = s.client.Logout(ctx)
-	if s.client.Store != nil {
-		_ = s.client.Store.Delete(ctx)
-	}
-	s.client.Disconnect()
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.client != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		// tenta encerrar sessão ativa
+		_ = s.client.Logout(ctx)
+
+		// apaga dados persistidos (chaves/sessão)
+		if s.client.Store != nil {
+			_ = s.client.Store.Delete(ctx)
+		}
+
+		// encerra conexões
+		s.client.Disconnect()
+	}
+
+	// limpa estado
 	s.connected = false
 	s.loggedIn = false
+	s.qrStr = ""
+	s.qrTS = time.Time{}
+	s.started = false
+	if s.stopChan != nil {
+		close(s.stopChan)
+		s.stopChan = nil
+	}
+
+	// recria client zerado com device novo para próximo pareamento
+	s.recreateClientUnlocked()
+
+	// persiste status desconectado
 	jid := s.jid
-	s.mu.Unlock()
 	_ = s.dbm.UpdateInstanceStatus(context.Background(), s.id, jid, false, false)
+
 	return nil
 }
 
@@ -720,4 +899,11 @@ func recoverMiddleware(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+func strOrEmpty(ns sql.NullString) string {
+	if ns.Valid {
+		return ns.String
+	}
+	return ""
 }

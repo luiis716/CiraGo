@@ -9,11 +9,18 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // driver "pgx" (database/sql)
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 )
+
+/*
+ DBManager (schema público):
+ - Usa sqlstore.NewWithDB(root) para o whatsmeow aplicar migrações no schema "public"
+ - Tabela public.meows_instances guarda metadados das sessões
+*/
 
 type DBManager struct {
 	DSN       string              // ex.: postgres://user:pass@host:5432/db?sslmode=disable
@@ -21,10 +28,21 @@ type DBManager struct {
 	RootDB    *sql.DB             // conexão para metadados (public.meows_instances)
 }
 
+type InstanceRow struct {
+	ID         string
+	JID        sql.NullString
+	TokenPlain sql.NullString
+	Connected  bool
+	LoggedIn   bool
+	MeowsVer   sql.NullString
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+}
+
 // ---- Setup ----
 
 func NewDBManagerFromEnv() (*DBManager, error) {
-	// 1) DSN
+	// Monta DSN
 	var dsn string
 	if env := os.Getenv("PG_DSN"); env != "" {
 		dsn = ensureNoSearchPath(env) // remove search_path/options se tiver
@@ -35,13 +53,14 @@ func NewDBManagerFromEnv() (*DBManager, error) {
 		pass := os.Getenv("PG_PASSWORD")
 		db := getEnv("PG_DBNAME", "meows")
 		ssl := getEnv("PG_SSLMODE", "disable")
+		// protege @ em senhas simples
 		if strings.Contains(pass, "@") && !strings.Contains(pass, "%40") {
 			pass = strings.ReplaceAll(pass, "@", "%40")
 		}
 		dsn = fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=%s", user, pass, host, port, db, ssl)
 	}
 
-	// 2) abre RootDB para nossas queries de metadados
+	// Abre conexão base para queries próprias e para o container whatsmeow
 	root, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, err
@@ -51,7 +70,7 @@ func NewDBManagerFromEnv() (*DBManager, error) {
 		return nil, fmt.Errorf("falha ao conectar no Postgres: %w", err)
 	}
 
-	// 3) cria container usando a MESMA conexão (schema padrão = public)
+	// Usa a MESMA conexão no container (schema = public)
 	container := sqlstore.NewWithDB(root, "postgres", nil)
 
 	return &DBManager{
@@ -73,14 +92,14 @@ func ensureNoSearchPath(dsn string) string {
 	return u.String()
 }
 
-// Init: roda migração do whatsmeow e cria/ajusta tabela public.meows_instances
+// Init: migrações do whatsmeow + tabela de metadados
 func (m *DBManager) Init(ctx context.Context) error {
-	// migrações do whatsmeow (cria whatsmeow_version etc. no schema padrão: public)
+	// Aplica migrações do whatsmeow (cria whatsmeow_version etc. no "public")
 	if err := m.Container.Upgrade(ctx); err != nil {
 		return fmt.Errorf("whatsmeow migrate: %w", err)
 	}
 
-	// tabela de instâncias (metadados) — sempre qualificada em "public"
+	// Cria/garante tabela de metadados
 	const base = `
 CREATE TABLE IF NOT EXISTS public.meows_instances (
   id            TEXT PRIMARY KEY,
@@ -97,7 +116,7 @@ CREATE TABLE IF NOT EXISTS public.meows_instances (
 		return fmt.Errorf("criar public.meows_instances: %w", err)
 	}
 
-	// adiciona a coluna token_plain se não existir
+	// Adiciona token_plain se não existir (token em texto para ADMIN)
 	const addTokenPlain = `
 ALTER TABLE public.meows_instances
   ADD COLUMN IF NOT EXISTS token_plain TEXT;
@@ -178,6 +197,30 @@ func (m *DBManager) DeleteInstance(ctx context.Context, id string) error {
 	const q = `DELETE FROM public.meows_instances WHERE id=$1`
 	_, err := m.RootDB.ExecContext(ctx, q, id)
 	return err
+}
+
+// Lista todas as instâncias persistidas (para pré-carregar no boot)
+func (m *DBManager) ListInstances(ctx context.Context) ([]InstanceRow, error) {
+	const q = `
+SELECT id, jid, token_plain, connected, logged_in, meows_version, created_at, updated_at
+  FROM public.meows_instances
+  ORDER BY created_at ASC;
+`
+	rows, err := m.RootDB.QueryContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []InstanceRow
+	for rows.Next() {
+		var r InstanceRow
+		if err := rows.Scan(&r.ID, &r.JID, &r.TokenPlain, &r.Connected, &r.LoggedIn, &r.MeowsVer, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ---- Helpers ----
